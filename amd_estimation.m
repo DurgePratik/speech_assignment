@@ -1,11 +1,3 @@
-%% ============================================================
-%  Objective 1 - Final AMD Pitch Estimation with Auto Label
-%  ------------------------------------------------------------
-%  Author: [Your Name]
-%  Description:
-%     - Estimates pitch (F0) using AMD with octave correction
-%     - Displays final estimated pitch directly on graphs
-%  ============================================================
 
 clear; clc; close all;
 
@@ -105,9 +97,6 @@ grid on;
 % writetable(T, 'amd_pitch_output.csv');
 % fprintf('Saved results to amd_pitch_output.csv\n');
 
-%% ============================================================
-%                  Helper Functions
-% ============================================================
 
 function f0 = amd_pitch_refined(frame, fs, tau_min, tau_max)
     frame = frame - mean(frame);
