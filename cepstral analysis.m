@@ -1,9 +1,8 @@
-% estimate_formants_pitch_cepstral.m
-% Usage: run in folder containing 'hindi_uu.wav' (or change wavfile below)
+ 
 clear; close all; clc;
 
 %% Parameters
-wavfile = 'hindi_uu.wav';    % change if needed
+wavfile = 'hindi_uu.wav';   
 preemph = 0.97;
 frame_dur = 0.03;            % 30 ms frames
 hop_dur   = 0.01;            % 10 ms hop
@@ -223,7 +222,7 @@ title('Estimated formant tracks from cepstrally-smoothed spectrum');
 ylim([0 5000]);
 grid on;
 
-%% Save results to struct (optional)
+
 results.Ftracks = F;
 results.pitchPerFrame = pitchHz;
 results.smoothedLogSpec = smoothedLogSpec;
