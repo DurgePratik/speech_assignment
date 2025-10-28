@@ -1,237 +1,267 @@
  
 clear; close all; clc;
 
-%% Parameters
-wavfile = 'hindi_uu.wav';   
+%% PARAMETERS
+wav_path = 'hindi_dha.wav';  % change to your filename
 preemph = 0.97;
-frame_dur = 0.03;            % 30 ms frames
-hop_dur   = 0.01;            % 10 ms hop
-lifter_ms = 1.5;             % low-time lifter cutoff in milliseconds (controls smoothing)
-max_formant_freq = 5000;     % Hz (search for peaks up to this freq)
-min_pitch = 50;              % Hz
-max_pitch = 500;             % Hz
-peak_prominence = 0.1;       % adapt if needed for peak detection (relative)
-min_consecutive_voiced = 6;  % requirement from user
+frame_dur = 0.03;         % 30 ms
+hop_dur = 0.01;           % 10 ms
+lifter_ms = 1.5;          % ms lifter for smoothing
+max_formant_freq = 5000;  % Hz
+min_pitch = 50;           % Hz
+max_pitch = 500;          % Hz
+peak_prominence = 0.1;
+min_consecutive_voiced = 6;
 
-%% Read audio
-[x, fs] = audioread(wavfile);
-if size(x,2) > 1, x = mean(x,2); end
-x = x / max(abs(x));  % normalize
+%% READ AUDIO
+[x, fs] = audioread(wav_path);
+if size(x,2) > 1
+    x = mean(x,2); % stereo → mono
+end
+if all(x==0)
+    error('Audio is silent.');
+end
+x = x ./ max(abs(x)); % normalize
 
 % Pre-emphasis
-x = filter([1 -preemph], 1, x);
+x = [x(1); x(2:end) - preemph * x(1:end-1)];
 
-%% Framing
+%% FRAMING
 frame_len = round(frame_dur * fs);
-hop_len   = round(hop_dur * fs);
-nfft = 2^nextpow2(frame_len*4); % zero-pad for smoother spectra
-win = hamming(frame_len);
+hop_len = round(hop_dur * fs);
+if length(x) < frame_len
+    error('Audio too short for chosen frame duration.');
+end
+num_frames = 1 + floor((length(x) - frame_len) / hop_len);
 
-frames = buffer(x, frame_len, frame_len - hop_len, 'nodelay');
-numFrames = size(frames,2);
-
-% Remove last column if shorter than frame_len (buffer with nodelay may truncate)
-if size(frames,1) < frame_len
-    frames = frames(1:frame_len,:);
+frames = zeros(frame_len, num_frames);
+for i = 1:num_frames
+    start_idx = (i-1)*hop_len + 1;
+    frames(:,i) = x(start_idx:start_idx+frame_len-1);
 end
 
-% Time axis for frame centers
-frame_times = ((0:(numFrames-1))*hop_len + frame_len/2) / fs;
+win = hamming(frame_len);
+frame_times = ((0:num_frames-1)*hop_len + frame_len/2) / fs;
 
-%% Pre-allocate
-cepstra = zeros(nfft, numFrames);      % complex ifft length nfft
-smoothedLogSpec = zeros(nfft/2+1, numFrames);
-freqAxis = (0:(nfft/2))*(fs/nfft);
-queffAxis = (0:(nfft-1))/fs;           % seconds (quefrency)
+% FFT size (4× zero-padding)
+nfft = 1;
+while nfft < frame_len * 4
+    nfft = nfft * 2;
+end
+M = nfft/2 + 1;
+freq_axis = linspace(0, fs/2, M);
 
-% Lifter index (convert lifter_ms to samples/time domain)
-lifter_n = round(lifter_ms * 1e-3 * fs); % number of samples to keep around 0 quefrency
+% Lifter in samples
+lifter_n = round(lifter_ms * 1e-3 * fs);
 
-pitchHz = zeros(1, numFrames);
-F = nan(3, numFrames); % F(1,:) F1, F(2,:) F2, F(3,:) F3
+cepstra = zeros(nfft, num_frames);
+smoothed_log_spec = zeros(M, num_frames);
+pitchHz = zeros(1, num_frames);
+F = nan(3, num_frames);
 
-%% Framewise processing
-for k = 1:numFrames
-    fr = frames(:,k).*win;
+%% FRAMEWISE PROCESSING
+for k = 1:num_frames
+    fr = frames(:,k) .* win;
     X = fft(fr, nfft);
-    magX = abs(X(1:nfft/2+1));
-    logMag = log(magX + eps);
+    magX = abs(X(1:M)) + eps;
+    logMag = log(magX);
     
-    % real cepstrum (via IFFT of log magnitude)
-    c = ifft([logMag; flipud(logMag(2:end-1))]); % reconstruct full spectrum for real ifft
-    c = real(c); % length nfft
-    
+    % Real cepstrum
+    mirrored = [logMag; logMag(end-1:-1:2)];
+    c = real(ifft(mirrored));
     cepstra(:,k) = c;
     
-    % lifter: low-time liftering -> smooth the log spectrum
-    % zero out high quefrency components (keep low quefrency components)
+    % Liftering
     cl = c;
-    % keep indices 1 : lifter_n and last lifter_n (mirror)
     if lifter_n < length(c)/2
-        cl(lifter_n+1 : end-lifter_n) = 0;
+        cl(lifter_n+1:end-lifter_n) = 0;
     end
-    % back to (smoothed) log spectrum
+    
+    % Smoothed log spectrum
     smLogFull = fft(cl);
-    smLogPos = real(smLogFull(1:nfft/2+1)); % positive freqs
-    smoothedLogSpec(:,k) = smLogPos;
+    smLogPos = real(smLogFull(1:M));
+    smoothed_log_spec(:,k) = smLogPos;
     
-    % formant estimation from smoothed log magnitude:
-    % find peaks in the smoothed log magnitude up to max_formant_freq
-    fIdxMax = find(freqAxis <= max_formant_freq, 1, 'last');
-    [pks, locs] = findpeaks(smLogPos(1:fIdxMax), 'MinPeakProminence', peak_prominence);
-    % if not enough peaks, relax prominence
-    if length(pks) < 3
-        [pks, locs] = findpeaks(smLogPos(1:fIdxMax));
+    % ---------- FORMANT ESTIMATION ----------
+    fidx_max = find(freq_axis <= max_formant_freq, 1, 'last');
+    if isempty(fidx_max)
+        fidx_max = M;
     end
-    % sort peaks by frequency (locs already in ascending freq), choose the three largest peaks by amplitude
+    % ensure nonnegative and small floor
+    rel_prom = max(0.001, peak_prominence * max(0, max(smLogPos(1:fidx_max))));
+    [pks, locs] = findpeaks(smLogPos(1:fidx_max), 'MinPeakProminence', rel_prom);
+    if isempty(pks)
+        [pks, locs] = findpeaks(smLogPos(1:fidx_max));
+    end
     if ~isempty(pks)
-        [~, sortidx] = sort(pks, 'descend');
-        topN = min(3, length(pks));
-        chosen = sortidx(1:topN);
-        chosen_locs = locs(chosen);
-        chosen_freqs = freqAxis(chosen_locs);
-        % sort chosen freqs ascending to map to F1<F2<F3 order
-        chosen_freqs = sort(chosen_freqs);
-        % assign to F matrix
-        F(1:length(chosen_freqs),k) = chosen_freqs(:);
+        [~, idx_sort] = sort(pks, 'descend');
+        topN = min(3, length(idx_sort));
+        chosen_freqs = sort(freq_axis(locs(idx_sort(1:topN))));
+        F(1:topN, k) = chosen_freqs;
     end
     
-    % Pitch estimation from cepstrum:
-    % Search cepstrum for peak in quefrency range corresponding to [max_pitch .. min_pitch]
-    qmin = round(fs / max_pitch);  % smallest quefrency index (in samples)
-    qmax = round(fs / min_pitch);  % largest quefrency index (in samples)
-    qmin = max(qmin,2); qmax = min(qmax, floor(nfft/2)); % avoid index 1 (0 quefrency)
-    cepSlice = c(qmin:qmax);
-    if ~isempty(cepSlice)
-        [mp, mi] = max(cepSlice);
-        peakIndex = (mi - 1) + qmin; % index into c
-        pitch_est = fs / peakIndex;  % Hz
-        pitchHz(k) = pitch_est;
-    else
-        pitchHz(k) = 0;
+    % ---------- PITCH ESTIMATION ----------
+    qmin = round(fs / max_pitch);
+    qmax = round(fs / min_pitch);
+    qmin = max(qmin, 2);
+    qmax = min(qmax, floor(nfft/2));
+    if qmax >= qmin && qmin <= length(c)
+        qmax_clamped = min(qmax, length(c));
+        cep_slice = c(qmin:qmax_clamped);
+        if ~isempty(cep_slice)
+            [~, mi] = max(cep_slice);
+            peak_idx = qmin + mi - 1;
+            if peak_idx > 0
+                pitch_est = fs / peak_idx;
+                pitchHz(k) = pitch_est;
+            end
+        end
     end
 end
 
-%% Voicing decision: use cepstral peak magnitude (normalized) and energy
-cep_peak_mag = zeros(1,numFrames);
-frame_energy = sum(frames.^2);
-for k = 1:numFrames
-    % use cepstrum magnitude in the pitch search region as voicing metric
+%% VOICING DECISION
+cep_peak_mag = zeros(1, num_frames);
+frame_energy = sum(frames.^2, 1);
+for k = 1:num_frames
     qmin = round(fs / max_pitch);
     qmax = round(fs / min_pitch);
-    qmin = max(qmin,2); qmax = min(qmax, floor(nfft/2));
+    qmin = max(qmin, 2);
+    qmax = min(qmax, floor(nfft/2));
     c = cepstra(:,k);
-    if qmax >= qmin
-        cep_peak_mag(k) = max(c(qmin:qmax));
+    if qmax >= qmin && qmin <= length(c)
+        qmax_clamped = min(qmax, length(c));
+        cep_peak_mag(k) = max(c(qmin:qmax_clamped));
     else
         cep_peak_mag(k) = 0;
     end
 end
-% normalize metrics
-cep_peak_mag = cep_peak_mag - min(cep_peak_mag);
-if max(cep_peak_mag)>0, cep_peak_mag = cep_peak_mag / max(cep_peak_mag); end
-frame_energy = frame_energy - min(frame_energy);
-if max(frame_energy)>0, frame_energy = frame_energy / max(frame_energy); end
 
-voiced_mask = (cep_peak_mag > 0.25) & (frame_energy > 0.1); % thresholds; may change per-file
+% Normalize (explicit max-min to avoid using range)
+denom1 = max(cep_peak_mag) - min(cep_peak_mag);
+if denom1 == 0, denom1 = 1e-8; end
+cep_peak_mag = (cep_peak_mag - min(cep_peak_mag)) ./ (denom1 + 1e-12);
 
-% enforce at least 6 consecutive frames: find longest run of voiced frames
-runs = bwlabel(voiced_mask);
-run_ids = unique(runs(runs>0));
-best_run_len = 0; best_run_id = 0;
-for rid = run_ids'
-    lenr = sum(runs==rid);
-    if lenr > best_run_len
-        best_run_len = lenr;
+denom2 = max(frame_energy) - min(frame_energy);
+if denom2 == 0, denom2 = 1e-8; end
+frame_energy_norm = (frame_energy - min(frame_energy)) ./ (denom2 + 1e-12);
+
+voiced_mask = (cep_peak_mag > 0.25) & (frame_energy_norm > 0.1);
+
+% Find consecutive voiced frames
+runs = zeros(1, num_frames);
+run_id = 0;
+i = 1;
+while i <= num_frames
+    if voiced_mask(i)
+        run_id = run_id + 1;
+        j = i;
+        while j <= num_frames && voiced_mask(j)
+            runs(j) = run_id;
+            j = j + 1;
+        end
+        i = j;
+    else
+        i = i + 1;
+    end
+end
+
+unique_runs = unique(runs(runs>0));
+best_run_len = 0;
+best_run_id = 0;
+for rid = unique_runs
+    len_run = sum(runs == rid);
+    if len_run > best_run_len
+        best_run_len = len_run;
         best_run_id = rid;
     end
 end
 
 if best_run_len >= min_consecutive_voiced
-    voiced_frames_idx = find(runs==best_run_id);
+    sel = find(runs == best_run_id);
 else
-    % fallback: take central voiced frames by energy (top min_consecutive_voiced frames)
-    [~, idxsort] = sort(frame_energy, 'descend');
-    voiced_frames_idx = sort(idxsort(1:min(min_consecutive_voiced, numFrames)));
-    warning('Could not find %d contiguous voiced frames; using %d highest-energy frames as fallback.', ...
-            min_consecutive_voiced, length(voiced_frames_idx));
+    [~, idx_energy] = sort(frame_energy_norm, 'descend');
+    sel = sort(idx_energy(1:min(min_consecutive_voiced, length(idx_energy))));
+    warning('Could not find %d contiguous voiced frames; using top-energy frames.', min_consecutive_voiced);
 end
 
-%% Compute averages over the chosen frames (only where F exists)
-sel = voiced_frames_idx;
-F1_frames = F(1,sel); F2_frames = F(2,sel); F3_frames = F(3,sel);
-% remove NaNs
-F1_mean = mean(F1_frames(~isnan(F1_frames)));
-F2_mean = mean(F2_frames(~isnan(F2_frames)));
-F3_mean = mean(F3_frames(~isnan(F3_frames)));
-pitch_mean = mean(pitchHz(sel(pitchHz(sel)>0)));
+%% COMPUTE AVERAGES
+if isempty(sel)
+    error('No frames selected for averaging.');
+end
+F1_mean = mean(F(1, sel), 'omitnan');
+F2_mean = mean(F(2, sel), 'omitnan');
+F3_mean = mean(F(3, sel), 'omitnan');
+valid_pitch_idx = sel(pitchHz(sel) > 0);
+if ~isempty(valid_pitch_idx)
+    pitch_mean = mean(pitchHz(valid_pitch_idx));
+else
+    pitch_mean = NaN;
+end
 
-% Print summary
-fprintf('\nSelected frames (indices): %s\n', mat2str(sel));
-fprintf('Average F1 over selected frames: %.1f Hz\n', F1_mean);
-fprintf('Average F2 over selected frames: %.1f Hz\n', F2_mean);
-fprintf('Average F3 over selected frames: %.1f Hz\n', F3_mean);
-fprintf('Average pitch (f0) over selected frames: %.1f Hz\n\n', pitch_mean);
+fprintf('\nSelected frame indices: '); disp(sel);
+fprintf('Average F1: %.1f Hz\n', F1_mean);
+fprintf('Average F2: %.1f Hz\n', F2_mean);
+fprintf('Average F3: %.1f Hz\n', F3_mean);
+fprintf('Average Pitch: %.1f Hz\n', pitch_mean);
 
-%% Plots
-% 1) Cepstrally smoothed spectra (image)
-figure('Name','Cepstrally smoothed log-spectrum (frames vs frequency)');
-imagesc(frame_times, freqAxis, smoothedLogSpec);
+%% (1) Cepstrally smoothed log-spectrum
+figure('Name','Cepstrally-smoothed log spectrum');
+imagesc(frame_times, freq_axis, smoothed_log_spec);
 axis xy;
-xlabel('Time (s)'); ylabel('Frequency (Hz)');
+colorbar;
+ylim([0 max_formant_freq]);
+xlabel('Time (s)');
+ylabel('Frequency (Hz)');
 title('Cepstrally-smoothed log spectrum (frames)');
-colorbar;
-ylim([0 5000]);
 
-% 2) Cepstral sequence (quefrency vs time)
-figure('Name','Cepstral sequence (frames vs quefrency)');
-% show only quefrency up to e.g. 20 ms (important for pitch & envelope)
+%% (2) Cepstral sequence (low quefrency)
 max_quef_ms = 20;
-max_quef_idx = min(nfft, round(max_quef_ms*1e-3*fs));
-imagesc(frame_times, (0:max_quef_idx-1)/fs*1000, cepstra(1:max_quef_idx,:));
+max_quef_idx = min(nfft, round(max_quef_ms * 1e-3 * fs));
+q_axis_ms = (0:max_quef_idx-1) / fs * 1000;
+figure('Name','Cepstral sequence');
+imagesc(frame_times, q_axis_ms, cepstra(1:max_quef_idx,:));
 axis xy;
-xlabel('Time (s)'); ylabel('Quefrency (ms)');
-title('Cepstral sequence (low quefrency region)');
 colorbar;
+xlabel('Time (s)');
+ylabel('Quefrency (ms)');
+title('Cepstral sequence (low quefrency region)');
 
-% 3) Framewise pitch contour & voiced mask
-figure('Name','Pitch contour and voicing');
+%% (3) Pitch contour & voicing
+figure('Name','Pitch & Voicing');
 subplot(2,1,1);
-plot(frame_times, pitchHz, '-o'); hold on;
-plot(frame_times(sel), pitchHz(sel), 'ro','MarkerFaceColor','r');
-xlabel('Time (s)'); ylabel('Pitch (Hz)');
-title('Framewise pitch (cepstral peak method)');
-ylim([0 max(500, max(pitchHz)+20)]);
-grid on;
+plot(frame_times, pitchHz, '-o', 'MarkerSize', 3);
+hold on;
+if ~isempty(sel)
+    plot(frame_times(sel), pitchHz(sel), 'ro', 'MarkerFaceColor','r');
+end
+xlabel('Time (s)');
+ylabel('Pitch (Hz)');
+ymax = max(500, max(pitchHz)+20);
+if isempty(ymax) || ~isfinite(ymax), ymax = 500; end
+ylim([0 ymax]);
+title('Framewise pitch (cepstral method)');
+
 subplot(2,1,2);
-plot(frame_times, cep_peak_mag, '-');
-hold on; plot(frame_times, frame_energy, '--'); legend('Cepstral peak mag (norm)','Energy (norm)');
-hold on; stem(frame_times, voiced_mask, 'k');
-xlabel('Time (s)'); ylabel('Normalized');
+plot(frame_times, cep_peak_mag, '-', 'DisplayName','Cepstral peak mag (norm)');
+hold on;
+plot(frame_times, frame_energy_norm, '--', 'DisplayName','Energy (norm)');
+stem(frame_times, double(voiced_mask), 'k.', 'DisplayName','Voiced mask');
+xlabel('Time (s)');
+ylabel('Normalized');
+legend;
 title('Voicing decision metrics and mask');
 
-% 4) Formants over time (F1-F3)
-figure('Name','Formant tracks (from smoothed spectrum)');
-plot(frame_times, F(1,:), 'b.-'); hold on;
-plot(frame_times, F(2,:), 'g.-');
-plot(frame_times, F(3,:), 'r.-');
-plot(frame_times(sel), F(1,sel), 'bo','MarkerFaceColor','b');
-xlabel('Time (s)'); ylabel('Frequency (Hz)');
-legend('F1','F2','F3','Location','northwest');
-title('Estimated formant tracks from cepstrally-smoothed spectrum');
-ylim([0 5000]);
+%% (4) Formants over time
+figure('Name','Formant tracks');
+plot(frame_times, F(1,:), 'b.-', 'DisplayName','F1'); hold on;
+plot(frame_times, F(2,:), 'g.-', 'DisplayName','F2');
+plot(frame_times, F(3,:), 'r.-', 'DisplayName','F3');
+if ~isempty(sel)
+    plot(frame_times(sel), F(1,sel), 'bo', 'MarkerFaceColor','b');
+end
+xlabel('Time (s)');
+ylabel('Frequency (Hz)');
+ylim([0 max_formant_freq]);
+legend('show');
 grid on;
-
-
-results.Ftracks = F;
-results.pitchPerFrame = pitchHz;
-results.smoothedLogSpec = smoothedLogSpec;
-results.cepstra = cepstra;
-results.frame_times = frame_times;
-results.selected_frames = sel;
-results.avgF1 = F1_mean;
-results.avgF2 = F2_mean;
-results.avgF3 = F3_mean;
-results.avgPitch = pitch_mean;
-
-% save('formant_pitch_results.mat','results');
+title('Estimated formant tracks from cepstrally-smoothed spectrum');
